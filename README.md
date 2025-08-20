@@ -270,9 +270,4 @@ _PIP_ADDITIONAL_REQUIREMENTS=google-cloud-bigquery==3.20.0
 ## 14) Conclusão
 
 O pipeline entrega uma base sólida para ingestão e análise de telemetria com **baixo atrito operacional** no Sandbox, respeitando limitações de billing e mantendo **clareza de camadas**. Quando o faturamento for ativado, a evolução natural envolve **materialização** (para dashboards de baixa latência), **streaming stateful** (Dataflow) e **observabilidade** completa.
-#   c a s e _ T e l e m e t r i a - I n d u s t r i a l - p u b s u b  
- #   c a s e _ T e l e m e t r i a - I n d u s t r i a l - p u b s u b  
- #   c a s e _ T e l e m e t r i a - I n d u s t r i a l - p u b s u b  
- #   c a s e _ T e l e m e t r i a - I n d u s t r i a l - p u b s u b  
- #   c a s e _ T e l e m e t r i a - I n d u s t r i a l - p u b s u b  
- 
+#
