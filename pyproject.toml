@@ -1,0 +1,26 @@
+[tool.poetry]
+name = "ingest-webhook"
+version = "0.1.0"
+description = "Webhook (FastAPI) para receber JSON e publicar no Pub/Sub"
+authors = ["you <you@example.com>"]
+readme = "README.md"
+packages = [{ include = "ingest_service", from = "src" }]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+fastapi = "^0.111.0"
+uvicorn = { extras = ["standard"], version = "^0.30.0" }
+google-cloud-pubsub = "^2.21.0"
+pydantic = "^2.7.0"
+pydantic-settings = "^2.2.1"
+requests = "^2.32.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.2.0"
+
+[tool.poetry.scripts]
+send-file = "ingest_service.tools.sender:main"
+
+[build-system]
+requires = ["poetry-core>=1.9.0"]
+build-backend = "poetry.core.masonry.api"
