@@ -273,4 +273,5 @@ O pipeline entrega uma base sólida para ingestão e análise de telemetria com 
 #   c a s e _ T e l e m e t r i a - I n d u s t r i a l - p u b s u b  
  #   c a s e _ T e l e m e t r i a - I n d u s t r i a l - p u b s u b  
  #   c a s e _ T e l e m e t r i a - I n d u s t r i a l - p u b s u b  
+ #   c a s e _ T e l e m e t r i a - I n d u s t r i a l - p u b s u b  
  
