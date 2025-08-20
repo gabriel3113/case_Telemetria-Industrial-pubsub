@@ -1,232 +1,284 @@
-# Projeto: Pipeline de Telemetria Industrial (Webhook + Airflow + BigQuery Sandbox)
+# Projeto: Ingestão por Webhook → Pub/Sub (sem Airflow)
 
-> **Resumo executivo**: Este projeto implementa ingestão **batch** e **(proto) streaming** de telemetria industrial e manutenção, com orquestração em **Apache Airflow** (Docker), persistência em **BigQuery** e camada analítica construída via **VIEWs** (compatível com **BigQuery Sandbox**). Restrições de faturamento (billing) impediram o uso de Cloud Run/Dataflow; por isso o desenho privilegia **LOAD jobs** e **Views** sem DML.
-
----
-
-## 1) Objetivos de negócio e técnicos
-
-* **Consolidar dados** de sensores (telemetria) e manutenção em camadas: `raw` → `trusted` → `refined`.
-* **Qualidade**: validar schema, normalizar unidades, isolar inválidos (DLQ lógico) e preparar indicadores.
-* **Orquestração confiável**: Airflow para execução reprodutível, versionável e observável.
-* **Compatibilidade Sandbox**: evitar DML/serviços pagos — usar Views e LOAD jobs.
-* **Evolutividade**: caminho claro para streaming real (Pub/Sub → Cloud Run/Dataflow → BigQuery) quando billing for habilitado.
-
-KPIs sugeridos:
-
-* % de leituras inválidas (DLQ) por dia;
-* Latência do batch (arquivo → consultas);
-* Cobertura de sensores por equipamento;
-* Tendências (min/p50/max/avg) por sensor/dia.
+> **Resumo:** Este documento descreve a solução **atual** entregue: um **Webhook HTTP** (FastAPI/Poetry) que recebe eventos de telemetria e publica no **Google Cloud Pub/Sub**. Não há etapas de orquestração (Airflow) nem persistência em BigQuery dentro deste escopo, por **limitações de billing** no GCP. O desenho, entretanto, já prepara a evolução para consumidores e camadas analíticas quando o faturamento puder ser habilitado.
 
 ---
 
-## 2) Escopo e entregáveis
+## 1) Objetivos
 
-* **DAG 1 — `raw_ingest`**: criação de tabelas `raw.*`, limpeza e LOAD de telemetria (NDJSON) e manutenção (CSV→NDJSON), tolerante a formatos imperfeitos.
-* **DAG 2 — `transform_refine_views_only`**: criação/atualização de **VIEWs** para DLQ lógico, trusted e refined (agregações, último valor, enriquecimento com manutenção).
-* **Webhook (prototipado)**: FastAPI que recebe POST `/ingest` e publica no **Pub/Sub** (ordering opcional). Cloud Run não implantado por falta de billing.
-* **Infra local**: `docker-compose` (Airflow Celery + Redis + Postgres), `.env`, volumes `dags/`, `data/`, `keys/`.
-* **Documentação** (este documento) + instruções de operação e troubleshooting.
+* **Receber eventos** de telemetria via HTTP de forma simples e rápida.
+* **Validar e padronizar** campos mínimos do payload.
+* **Publicar de forma confiável** os eventos no **Pub/Sub** com atributos úteis (tracing/ordering), permitindo escala horizontal futura.
+* **Isolar responsabilidades**: captura/validação (webhook) separada do processamento (consumidores a serem adicionados).
+
+**Fora de escopo no momento (motivo: billing GCP):** Cloud Run/Functions como consumidores, Dataflow Streaming, BigQuery (Storage Write API), DLQ material em tópicos separados.
 
 ---
 
-## 3) Arquitetura
+## 2) Arquitetura Atual
 
 ```
-[Fontes locais / Webhook]
- telemetria.ndjson ─┐
- manutencao.csv   ───┤         Docker (localhost)
-                     │      ┌────────────────────────┐
-  FastAPI /ingest  ──┴──▶   │ Apache Airflow (Celery)│
-                            │  DAG raw_ingest        │
-                            │  DAG transform_refine  │
-                            └────────────────────────┘
-                                     │ LOAD (BQ API)
-                                     ▼
-                               BigQuery (Sandbox)
-                     ┌────────────────────────────────────────────┐
-                     │ raw.telemetry_ingest (tabela)              │
-                     │ raw.maintenance_ingest (tabela)            │
-                     │ raw.telemetry_dlq_view (VIEW)              │
-                     │ trusted.telemetry (VIEW)                   │
-                     │ refined.telemetry_daily (VIEW)             │
-                     │ refined.telemetry_latest_by_sensor (VIEW)  │
-                     │ refined.telemetry_with_maintenance (VIEW)  │
-                     └────────────────────────────────────────────┘
+Produtor (cliente) ──HTTP POST /ingest──▶ Webhook (FastAPI)
+                                        └─▶ Pub/Sub Topic: telemetry-events
 ```
 
-**Decisões-chave**:
+* **Webhook**: expõe `/ingest` (JSON). Faz validação leve, normalização básica e publica uma mensagem por evento.
+* **Pub/Sub**: armazena e distribui as mensagens para futuras **subscriptions** (pull/push).
+* **Sem consumidor** por decisão de escopo: backlog permanece no tópico/assinaturas até existir um subscriber (Cloud Run/Function/Dataflow) em fase 2.
 
-* **Views no Sandbox** para evitar DML (CREATE VIEW é DDL, permitido).
-* **Preprocess CSV→NDJSON** para fugir de aspas/delimitadores quebrados do parser CSV do BigQuery.
-* **Particionamento/cluster** nas tabelas `raw` para performance de consulta.
+### 2.1 Diagrama de Sequência
 
-Roadmap (quando houver billing):
-
-* Substituir Views por **tabelas materializadas** ou ETLs com DML (`MERGE`), habilitar **Cloud Run**/Dataflow para streaming.
-
----
-
-## 4) Componentes e responsabilidades
-
-### 4.1 Airflow (Docker Compose)
-
-* Serviços: `airflow-apiserver`, `airflow-scheduler`, `airflow-worker`, `redis`, `postgres`.
-* Volumes: `dags/` (código), `data/` (arquivos), `keys/` (SA JSON), `logs/`.
-* Credenciais: variáveis no `.env`; SA com papéis de BigQuery (ao menos Data Editor no dataset/projeto).
-
-### 4.2 BigQuery (Sandbox)
-
-* Datasets: `raw`, `trusted`, `refined`.
-* Tabelas: `raw.telemetry_ingest` (particionada por `DATE(timestamp)`, cluster por `equipment_id,sensor_id`) e `raw.maintenance_ingest` (particionada por `DATE(start_ts)`).
-* Views: DLQ lógico, trusted, refined (agregações, latest, join com manutenção).
-
-### 4.3 Webhook (prototipado)
-
-* FastAPI `/ingest` — valida payload, serializa datetimes, publica em Pub/Sub.
-* Autenticação GCP: `GOOGLE_APPLICATION_CREDENTIALS` apontando para SA.
-* Erros resolvidos: 422 (falta `timestamp`), serialização `datetime`, ordering key, ADC.
+1. Cliente envia `POST /ingest` com JSON.
+2. Webhook valida (`Pydantic`) e normaliza (`timestamp`, `units`, `strings`).
+3. Webhook publica no Pub/Sub (`PublisherClient`) com atributos (ver §5.3).
+4. Webhook responde `202 Accepted` (assíncrono por natureza do publish).
 
 ---
 
-## 5) Contratos de dados
+## 3) Componentes
 
-### 5.1 Telemetria (NDJSON — 1 registro por linha)
+### 3.1 Ingest Service (FastAPI + Poetry)
+
+* **Endereço**: `POST /ingest` (conteúdo `application/json`).
+* **Validação**: `Pydantic` exige campos chave: `timestamp`, `equipment_id`, `sensor_id`, `value`, `unit`.
+* **Tratamento de erros**: respostas `422` (schema), `400` (negócio), `500` (falhas internas/pub).
+* **Publicação**: utiliza `google-cloud-pubsub` com **Service Account** (ADC) carregada via `GOOGLE_APPLICATION_CREDENTIALS`.
+* **Logs**: estruturados, incluem `event_id`, `equipment_id`, `sensor_id` e `publish_result` (message\_id/erro).
+
+### 3.2 Google Cloud Pub/Sub
+
+* **Topic sugerido**: `telemetry-events`.
+* **Atributos em cada mensagem** (key/value string):
+
+  * `schema_version` (ex.: `v1`)
+  * `equipment_id`
+  * `sensor_id`
+  * `event_ts` (ISO8601)
+  * `ordering_key` (opcional: `equipment_id`)
+  * `content_type` (`application/json`)
+* **Subscriptions** (a criar na fase 2):
+
+  * `bq-writer` (Cloud Run → BigQuery)
+  * `dlq` (dead-letter) com política de reentrega/estouro
+
+### 3.3 Credenciais
+
+* **Service Account** com papel mínimo: `roles/pubsub.publisher` no projeto.
+* **Arquivo JSON** montado via variável: `GOOGLE_APPLICATION_CREDENTIALS=/path/sa.json`.
+
+---
+
+## 4) Contrato de Dados (Payload)
+
+### 4.1 Telemetria JSON (requerido no POST)
 
 ```json
 {
   "timestamp": "2024-05-25T10:30:00.123Z",
   "equipment_id": "TURBINE_A",
-  "sensor_id": "TBN_001_TMP",  // ^(TBN|GNR)_[0-9]{3}_(TMP|VIB|PRS)$
+  "sensor_id": "TBN_001_TMP",
   "value": 150.5,
-  "unit": "Celsius"             // mapeado p/ C|bar|g
+  "unit": "Celsius"
 }
 ```
 
-Campos obrigatórios: `timestamp`, `equipment_id`, `sensor_id`. Regras validadas em Views (trusted/DLQ).
+* **Regras mínimas**:
 
-### 5.2 Manutenção (CSV → NDJSON)
+  * `timestamp` em **ISO8601** (`Z` ou offset explícito).
+  * `sensor_id` deve seguir regex **`^(TBN|GNR)_[0-9]{3}_(TMP|VIB|PRS)$`** (recomendado; se estrito, responder 400).
+  * `unit` aceita: `Celsius`, `C`, `°C`, `Bar`, `g` (mapeáveis a `C`, `bar`, `g`).
 
-Header: `maintenance_id,equipment_id,start_ts,end_ts,type,notes`. Linhas curtas: `notes=NULL`.
+### 4.2 Normalizações no Webhook
 
----
-
-## 6) DAGs
-
-### 6.1 `raw_ingest`
-
-* **ensure\_raw\_tables**: cria dataset `raw` e tabelas com particionamento/cluster; cria `raw.telemetry_dlq` (para uso futuro material).
-* **load\_telemetry**: limpa NDJSON (remove comentários `#...`, vírgulas finais, ruído fora de `{}`) e **LOAD** para `raw.telemetry_ingest` (schema fixo com `REQUIRED` nas chaves).
-* **load\_maintenance**: pré-processa CSV problemático para **NDJSON** (normaliza delimitadores/aspas, garante 6 colunas) e **LOAD** para `raw.maintenance_ingest`.
-
-### 6.2 `transform_refine_views_only`
-
-* Garante datasets `trusted` e `refined`.
-* Cria/atualiza Views:
-
-  * `raw.telemetry_dlq_view`: lista inválidos com `reason` (regex sensor, unidades desconhecidas, NULLs).
-  * `trusted.telemetry`: **válidos** + unidades normalizadas (C, bar, g) + `event_date`.
-  * `refined.telemetry_daily`: min/p50/max/avg/contagem por dia/equipamento/sensor.
-  * `refined.telemetry_latest_by_sensor`: `ROW_NUMBER()` para último valor por sensor.
-  * `refined.telemetry_with_maintenance`: flag de sobreposição com janelas de manutenção.
+* Converte `timestamp` para string canonical (UTC Z) se necessário.
+* `unit` opcionalmente normalizada para um conjunto conhecido; se desconhecida, pode-se publicar com atributo `unit_unknown=true` para roteamento posterior.
 
 ---
 
-## 7) Operação (runbooks)
+## 5) Publicação no Pub/Sub
 
-### 7.1 Subir o ambiente
+### 5.1 Código (resumo conceitual)
 
-1. `docker compose up airflow-init`
-2. `docker compose up -d`
-3. UI do Airflow: `http://localhost:8080` (admin/admin).
+```python
+from google.cloud import pubsub_v1
+publisher = pubsub_v1.PublisherClient()
+topic_path = publisher.topic_path(PROJECT_ID, "telemetry-events")
 
-### 7.2 Executar pipelines
+# payload: dict já validado por Pydantic
+body = json.dumps(payload).encode("utf-8")
+attrs = {
+  "schema_version": "v1",
+  "equipment_id": payload["equipment_id"],
+  "sensor_id": payload["sensor_id"],
+  "event_ts": payload["timestamp"],
+  "content_type": "application/json",
+}
+future = publisher.publish(topic_path, data=body, **attrs)
+message_id = future.result(timeout=10)
+```
 
-* Coloque arquivos em `data/`: `telemetria.ndjson`, `manutencao.csv`.
-* Rode `raw_ingest` (carrega `raw.*`).
-* Rode `transform_refine_views_only` (cria Views).
+### 5.2 Ordenação (opcional)
 
-### 7.3 Reprocessar
+* Para garantir ordem por equipamento, habilitar **message ordering** no tópico e setar `ordering_key=equipment_id`.
+* Requer: tópico com ordering **enabled**; consumidor que reconheça a ordenação.
 
-* **Clear** task(s) e **Run** novamente; ou `airflow tasks clear` / `airflow dags trigger` via CLI.
+### 5.3 Idempotência
 
-### 7.4 Consultas úteis
+* Recomenda-se incluir `event_id` (hash de `equipment_id+sensor_id+timestamp`) como atributo; consumidores podem **deduplicar**.
 
-* Inválidos: `SELECT * FROM raw.telemetry_dlq_view LIMIT 50;`
-* Válidos normalizados: `SELECT * FROM trusted.telemetry ORDER BY event_ts DESC LIMIT 50;`
-* Agregados: `SELECT * FROM refined.telemetry_daily WHERE sensor_id LIKE '%_VIB';`
-* Últimos valores: `SELECT * FROM refined.telemetry_latest_by_sensor;`
-* Em manutenção: `SELECT * FROM refined.telemetry_with_maintenance WHERE in_maintenance;`
+### 5.4 DLQ
 
----
-
-## 8) Qualidade de dados e idempotência
-
-* **Limpeza** (telemetria): descarta linhas irrecuperáveis (comentadas, inválidas JSON).
-* **CSV→NDJSON** (manutenção): evita falhas por aspas/delimitadores; garante schema estável.
-* **DLQ lógico**: `raw.telemetry_dlq_view` explicita o motivo de rejeição; auditável.
-* **Idempotência**: `WRITE_APPEND` — repetir a ingestão duplica registros. Com billing: evoluir para `MERGE`/dedupe em `trusted`.
-
----
-
-## 9) Segurança e IAM
-
-* **Service Account** (JSON) montada em `keys/sa.json` e referenciada por `GOOGLE_APPLICATION_CREDENTIALS`.
-* Princípios: menor privilégio (BigQuery Data Editor no dataset), nunca versionar a chave, rotacionar periodicamente.
+* Configurar **Dead Letter Policy** na assinatura (fase 2). Mensagens com N falhas vão para `telemetry-events-dlq`.
 
 ---
 
-## 10) Performance e custo
+## 6) Estrutura do Projeto
 
-* **Views** calculam on-demand; custo proporcional aos dados lidos (no Sandbox não há cobrança, mas há limites de uso).
-* **Partição + Cluster** nas tabelas `raw` favorecem *partition pruning* e filtros por sensor/equipamento.
-* Com billing: considerar **Materialized Views**/tabelas agregadas para dashboards pesados.
+```
+repo/
+ ├─ src/ingest_service/
+ │   ├─ main.py            # FastAPI app, rotas
+ │   ├─ models.py          # Pydantic schemas (Request/Response)
+ │   ├─ publisher.py       # Cliente Pub/Sub (wrap + retries)
+ │   ├─ config.py          # Settings (pydantic-settings)
+ │   └─ logging.py         # Config de logs estruturados
+ ├─ pyproject.toml         # Poetry
+ ├─ .env.example
+ ├─ README.md
+ └─ Dockerfile (opcional)
+```
 
----
+### 6.1 Variáveis de Ambiente
 
-## 11) Troubleshooting (erros reais e correções)
+| Nome                             | Descrição                                |
+| -------------------------------- | ---------------------------------------- |
+| `PROJECT_ID`                     | ID do projeto GCP                        |
+| `PUBSUB_TOPIC`                   | Nome do tópico (ex.: `telemetry-events`) |
+| `GOOGLE_APPLICATION_CREDENTIALS` | Caminho do JSON da SA                    |
+| `PUBLISH_ORDERING_ENABLED`       | `true/false`                             |
+| `LOG_LEVEL`                      | `INFO/DEBUG`                             |
 
-* **`ValidationError PROJECT_ID`**: definir `PROJECT_ID` no `.env` e reiniciar serviços.
-* **`DefaultCredentialsError`**: setar `GOOGLE_APPLICATION_CREDENTIALS` para a SA; garantir permissões de BigQuery.
-* **422 no `/ingest`**: payload sem `timestamp`; alinhar schema do POST.
-* **`datetime is not JSON serializable`**: converter para string ISO (`.isoformat()` ou `%Y-%m-%dT%H:%M:%S.%fZ`).
-* **`Cannot publish with ordering key`**: habilitar ordering no tópico Pub/Sub ou remover ordering key.
-* **CSV erros (aspas/delimitadores)**: usar **pré-processamento CSV→NDJSON**.
-* **`Provided schema does not match`**: alinhar `REQUIRED` vs `NULLABLE` e desativar `autodetect` no LOAD de manutenção.
-* **`CREATE VIEW AS SELECT AS VALUE`**: não suportado; usar CTE + `ROW_NUMBER()`.
-* **`billingNotEnabled / DML not allowed`**: usar **Views** (DDL) e LOAD jobs; evitar DML.
-
----
-
-## 12) Roadmap de evolução
-
-1. **Habilitar billing**; migrar Views para **tabelas materializadas**/MERGE idempotente.
-2. **Streaming** fim-a-fim: Pub/Sub → Cloud Run (leve) ou **Dataflow (streaming)** → BigQuery (`trusted/refined`).
-3. **DLQ material**: popular `raw.telemetry_dlq` (tabela) com DML e auditoria detalhada.
-4. **Observabilidade**: métricas (prometheus/stackdriver), alertas Airflow, monitor de % inválidos.
-5. **Catálogo**: descrever contratos e políticas (Data Catalog/BigQuery tags).
-6. **CICD**: testes unitários para DAGs e SQLs, lint, deploy automatizado (Composer/GitHub Actions).
-
----
-
-## 13) Apêndices
-
-### 13.1 Exemplo de POST (Webhook)
+### 6.2 Execução local
 
 ```bash
-curl -X POST http://localhost:8080/ingest \
-  -H 'Content-Type: application/json' \
+poetry install
+poetry run uvicorn ingest_service.main:app --reload --port 8080
+```
+
+### 6.3 Teste rápido (curl)
+
+```bash
+curl -X POST http://127.0.0.1:8080/ingest \
+  -H 'content-type: application/json' \
   -d '{
-    "sensor_id":"TBN_001_TMP",
-    "equipment_id":"TURBINE_A",
     "timestamp":"2024-05-25T10:30:00.123Z",
+    "equipment_id":"TURBINE_A",
+    "sensor_id":"TBN_001_TMP",
     "value":150.5,
     "unit":"Celsius"
   }'
 ```
 
-### 13.2 Snippet para enviar linha a linha (arquivo NDJSON)
+Resposta esperada: `202 Accepted` (com corpo JSON de confirmação e `message_id`, se exposto).
+
+---
+
+## 7) Operação e Observabilidade
+
+* **Logs estruturados**: cada requisição registra status, latência, atributos de publicação, exceções com stacktrace.
+* **Métricas** (opcional): contadores por sensor/equipamento, erros de validação, taxa de publicação, percentil de latência.
+* **Healthcheck**: `GET /healthz` retorna 200 para readiness/liveness (Docker/K8s/Run).
+* **Backpressure**: se `publisher.publish` atrasar, retornar `202` e enfileirar; impor limites de payload/tamanho.
+
+---
+
+## 8) Segurança
+
+* **Autenticação no GCP**: SA restrita a `roles/pubsub.publisher`.
+* **Webhook**: considerar **API Key**/Token no header (`Authorization: Bearer ...`) quando exposto fora da rede confiável.
+* **Rate limiting**: proteção contra abuso (ex.: 100 req/s por IP) e limites de tamanho (`Content-Length`).
+* **Sanitização**: remover/Pseudonimizar PII se aparecer em `notes`/campos livres.
+
+---
+
+## 9) Limitações atuais (e justificativa)
+
+* **Sem consumidores** (Cloud Run/Dataflow/Functions) e **sem BigQuery** por **billing desativado**.
+* **Sem DLQ material** (apenas conceito).
+* **Sem garantia de ordenação** se `ordering_key` estiver desligado.
+
+> Essas decisões mantêm o escopo **executável** sem custos, preparando terreno para a Fase 2 com billing.
+
+---
+
+## 10) Evolução (quando billing estiver ativo)
+
+1. **Cloud Run Subscriber** (Push Subscription): recebe mensagens, valida, escreve no **BigQuery** via **Storage Write API** (baixa latência/Exactly-Once), enriquece/roteia para DLQ.
+2. **Dataflow Streaming** (se houver janelas/estado): Pub/Sub → Beam → Trusted/Refined (BQ) com janelas, dedup, side inputs (mapa de unidades), late data.
+3. **Views/Tabelas Analíticas**: criar `trusted.telemetry` e `refined.*` (daily, latest, with\_maintenance) como **materializadas** ou populadas com **MERGE**.
+4. **Observabilidade**: Cloud Logging, Error Reporting, Cloud Monitoring dashboards/alertas.
+
+---
+
+## 11) Anexos
+
+### 11.1 OpenAPI (trecho)
+
+```yaml
+openapi: 3.0.3
+paths:
+  /ingest:
+    post:
+      summary: Ingestão de eventos de telemetria
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Telemetry'
+      responses:
+        '202': { description: Aceito }
+        '400': { description: Erro de negócio }
+        '422': { description: Payload inválido }
+        '500': { description: Erro interno }
+components:
+  schemas:
+    Telemetry:
+      type: object
+      required: [timestamp, equipment_id, sensor_id, value, unit]
+      properties:
+        timestamp: { type: string, format: date-time }
+        equipment_id: { type: string }
+        sensor_id: { type: string }
+        value: { type: number }
+        unit: { type: string }
+```
+
+### 11.2 gcloud (criar tópico e assinatura)
+
+```bash
+gcloud pubsub topics create telemetry-events \
+  --message-storage-policy-allowed-regions=us-east1
+
+gcloud pubsub subscriptions create telemetry-events-pull \
+  --topic=telemetry-events \
+  --ack-deadline=20
+```
+
+### 11.3 Dockerfile (sugestão)
+
+```dockerfile
+FROM python:3.12-slim
+WORKDIR /app
+COPY pyproject.toml poetry.lock* ./
+RUN pip install poetry && poetry config virtualenvs.create false \
+ && poetry install --no-interaction --no-ansi
+COPY src ./src
+ENV PORT=8080
+CMD ["uvicorn", "ingest_service.main:app", "--host", "0.0.0.0", "--port", "8080"]
+```
+
+### 11.4 Cliente de teste (linhas NDJSON)
 
 ```python
 import json, time, requests
@@ -234,40 +286,12 @@ url = "http://localhost:8080/ingest"
 with open("telemetria.ndjson") as f:
     for line in f:
         payload = json.loads(line)
-        r = requests.post(url, json=payload, timeout=5)
-        print(r.status_code, r.text)
-        time.sleep(0.1)  # opcional
-```
-
-### 13.3 SQLs de validação
-
-```sql
--- contagens básicas
-SELECT COUNT(*) FROM raw.telemetry_ingest;
-SELECT COUNT(*) FROM raw.maintenance_ingest;
-SELECT COUNT(*) FROM raw.telemetry_dlq_view;
-SELECT * FROM trusted.telemetry LIMIT 10;
-SELECT * FROM refined.telemetry_latest_by_sensor LIMIT 10;
-```
-
-### 13.4 Variáveis de ambiente (.env)
-
-```
-AIRFLOW_IMAGE_NAME=apache/airflow:3.0.4
-AIRFLOW_UID=50000
-AIRFLOW_PROJ_DIR=.
-_AIRFLOW_WWW_USER_USERNAME=admin
-_AIRFLOW_WWW_USER_PASSWORD=admin
-
-PROJECT_ID=SEU_PROJECT_ID
-BQ_LOCATION=US
-GOOGLE_APPLICATION_CREDENTIALS=/opt/airflow/keys/sa.json
-_PIP_ADDITIONAL_REQUIREMENTS=google-cloud-bigquery==3.20.0
+        requests.post(url, json=payload, timeout=3)
+        time.sleep(0.05)
 ```
 
 ---
 
-## 14) Conclusão
+## 12) Conclusão
 
-O pipeline entrega uma base sólida para ingestão e análise de telemetria com **baixo atrito operacional** no Sandbox, respeitando limitações de billing e mantendo **clareza de camadas**. Quando o faturamento for ativado, a evolução natural envolve **materialização** (para dashboards de baixa latência), **streaming stateful** (Dataflow) e **observabilidade** completa.
-#
+A solução atual entrega um **canal de ingestão confiável** (Webhook → Pub/Sub), com **contratos claros**, **validação** e **log** adequados, pronta para escalar com consumidores e camada analítica assim que o **billing** estiver disponível. O design separa captura de processamento, reduz acoplamento e facilita a evolução para **tempo real** ou **batch** conforme a necessidade.
